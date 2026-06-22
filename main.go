@@ -21,6 +21,7 @@ type config struct {
 	MaxRealmsPerIP     int
 	TrustedProxyHeader string
 	RealmNamePattern   string
+	MetricsListen      string
 }
 
 var (
@@ -57,6 +58,12 @@ func main() {
 	})
 	go s.reaper()
 
+	if cfg.MetricsListen != "" {
+		s.metrics = newMetrics()
+		s.metrics.registerGauges(s)
+		go serveMetrics(cfg.MetricsListen, s.metrics.reg)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           s.routes(),
@@ -84,6 +91,7 @@ func parseConfig(args []string) (config, error) {
 		MaxRealmsPerIP:     getenvInt("HYSTERIA_REALM_MAX_REALMS_PER_IP", 4),
 		TrustedProxyHeader: getenv("HYSTERIA_REALM_TRUSTED_PROXY_HEADER", ""),
 		RealmNamePattern:   getenv("HYSTERIA_REALM_NAME_PATTERN", defaultRealmNamePattern),
+		MetricsListen:      getenv("HYSTERIA_REALM_METRICS_LISTEN", ""),
 	}
 	fs := pflag.NewFlagSet("hysteria-realm-server", pflag.ContinueOnError)
 	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "address to listen on")
@@ -95,6 +103,7 @@ func parseConfig(args []string) (config, error) {
 	fs.IntVar(&cfg.MaxRealmsPerIP, "max-realms-per-ip", cfg.MaxRealmsPerIP, "maximum realms per client IP (0 = unlimited)")
 	fs.StringVar(&cfg.TrustedProxyHeader, "trusted-proxy-header", cfg.TrustedProxyHeader, "header to read real client IP from (e.g. X-Forwarded-For)")
 	fs.StringVar(&cfg.RealmNamePattern, "realm-name-pattern", cfg.RealmNamePattern, "regex realm names must match")
+	fs.StringVar(&cfg.MetricsListen, "metrics-listen", cfg.MetricsListen, "address to expose Prometheus metrics on (empty = disabled)")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}

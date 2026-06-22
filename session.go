@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -56,6 +57,10 @@ type server struct {
 	maxRealmsPerIP int
 	proxyHeader    string
 	realmIDPattern *regexp.Regexp
+
+	metrics            *metrics
+	activeEventStreams atomic.Int64
+	pendingConnects    atomic.Int64
 }
 
 func newServer(cfg serverConfig) *server {
@@ -140,6 +145,7 @@ func (s *server) registerPending(sess *session, nonce string) (chan punchRespons
 	}
 	ch := make(chan punchResponsePayload, 1)
 	sess.pending[nonce] = ch
+	s.pendingConnects.Add(1)
 	return ch, true
 }
 
@@ -165,6 +171,7 @@ func (s *server) cancelPending(sess *session, nonce string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(sess.pending, nonce)
+	s.pendingConnects.Add(-1)
 }
 
 func (s *server) sendEvent(sess *session, ev sessionEvent) bool {
@@ -196,6 +203,7 @@ func (s *server) reaper() {
 		s.mu.Unlock()
 		for _, sess := range expired {
 			if s.removeExpiredSession(sess, now) {
+				s.metrics.sessionExpired()
 				debugf("session expired realm=%s session=%s", sess.realmID, sess.id)
 			}
 		}

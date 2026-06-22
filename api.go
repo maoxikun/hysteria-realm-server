@@ -29,6 +29,9 @@ func limitBody(next http.Handler) http.Handler {
 
 func (s *server) routes() http.Handler {
 	r := chi.NewRouter()
+	if s.metrics != nil {
+		r.Use(s.metrics.httpMiddleware)
+	}
 	r.Use(limitBody)
 	r.Post("/v1/{id}", s.register)
 	r.Delete("/v1/{id}", s.deregister)
@@ -70,11 +73,13 @@ func (s *server) realmID(w http.ResponseWriter, r *http.Request) (string, bool) 
 func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.realmID(w, r)
 	if !ok {
+		s.metrics.registration("bad_request")
 		return
 	}
 	remote := s.requestIP(r)
 	if !s.checkRealmToken(r) {
 		debugf("register unauthorized realm=%s remote=%s", id, remote)
+		s.metrics.registration("invalid_token")
 		writeErr(w, http.StatusUnauthorized, errInvalidToken, "invalid realm token")
 		return
 	}
@@ -82,10 +87,12 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Addresses []string `json:"addresses"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.metrics.registration("bad_request")
 		writeErr(w, http.StatusBadRequest, errBadRequest, "invalid json")
 		return
 	}
 	if err := validateAddresses(req.Addresses); err != nil {
+		s.metrics.registration("bad_request")
 		writeErr(w, http.StatusBadRequest, errBadRequest, err.Error())
 		return
 	}
@@ -95,18 +102,21 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if _, exists := s.realms[id]; exists {
 		s.mu.Unlock()
 		debugf("register conflict realm=%s remote=%s", id, ip)
+		s.metrics.registration("conflict")
 		writeErr(w, http.StatusConflict, errRealmTaken, "realm already registered")
 		return
 	}
 	if s.maxRealms > 0 && len(s.realms) >= s.maxRealms {
 		s.mu.Unlock()
 		debugf("register rejected (global limit) realm=%s remote=%s", id, ip)
+		s.metrics.registration("global_limit")
 		writeErr(w, http.StatusTooManyRequests, errRealmLimit, "global realm limit reached")
 		return
 	}
 	if s.maxRealmsPerIP > 0 && s.ipCounts[ip] >= s.maxRealmsPerIP {
 		s.mu.Unlock()
 		debugf("register rejected (per-ip limit) realm=%s remote=%s", id, remote)
+		s.metrics.registration("ip_limit")
 		writeErr(w, http.StatusTooManyRequests, errIPLimit, "per-ip realm limit reached")
 		return
 	}
@@ -125,6 +135,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	s.ipCounts[ip]++
 	s.mu.Unlock()
 	debugf("registered realm=%s session=%s addresses=%d remote=%s", id, sess.id, len(req.Addresses), ip)
+	s.metrics.registration("ok")
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"session_id": sess.id,
@@ -146,6 +157,7 @@ func (s *server) deregister(w http.ResponseWriter, r *http.Request) {
 	}
 	debugf("deregistered realm=%s session=%s remote=%s", id, sess.id, remote)
 	s.removeSession(sess)
+	s.metrics.deregistration()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -158,6 +170,7 @@ func (s *server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSessionByToken(bearer(r))
 	if sess == nil || sess.realmID != id {
 		debugf("heartbeat unauthorized realm=%s remote=%s", id, remote)
+		s.metrics.heartbeat("invalid_token")
 		writeErr(w, http.StatusUnauthorized, errInvalidToken, "invalid session token")
 		return
 	}
@@ -166,12 +179,14 @@ func (s *server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Body != nil {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			s.metrics.heartbeat("bad_request")
 			writeErr(w, http.StatusBadRequest, errBadRequest, "invalid json")
 			return
 		}
 	}
 	if req.Addresses != nil {
 		if err := validateAddresses(req.Addresses); err != nil {
+			s.metrics.heartbeat("bad_request")
 			writeErr(w, http.StatusBadRequest, errBadRequest, err.Error())
 			return
 		}
@@ -180,6 +195,7 @@ func (s *server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if sess.closed {
 		s.mu.Unlock()
 		debugf("heartbeat closed realm=%s session=%s remote=%s", id, sess.id, remote)
+		s.metrics.heartbeat("invalid_token")
 		writeErr(w, http.StatusUnauthorized, errInvalidToken, "invalid session token")
 		return
 	}
@@ -189,6 +205,7 @@ func (s *server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	debugf("heartbeat realm=%s session=%s addressesUpdated=%t remote=%s", id, sess.id, req.Addresses != nil, remote)
+	s.metrics.heartbeat("ok")
 	if !s.sendEvent(sess, sessionEvent{kind: "heartbeat_ack", data: map[string]any{"ttl": int(sessionTTL.Seconds())}}) {
 		debugf("heartbeat ack dropped realm=%s session=%s remote=%s", id, sess.id, remote)
 	}
@@ -218,6 +235,9 @@ func (s *server) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+
+	s.activeEventStreams.Add(1)
+	defer s.activeEventStreams.Add(-1)
 
 	ctx := r.Context()
 	for {
@@ -268,12 +288,14 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errBadRequest, err.Error())
 		return
 	}
+	s.metrics.connectRequest()
 
 	s.mu.Lock()
 	sess := s.realms[id]
 	if sess == nil || sess.closed || time.Now().After(sess.expires) {
 		s.mu.Unlock()
 		debugf("connect realm not found realm=%s remote=%s", id, remote)
+		s.metrics.connectOutcome("no_realm")
 		writeErr(w, http.StatusNotFound, errRealmNotFound, "realm not registered")
 		return
 	}
@@ -285,6 +307,7 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 	respCh, ok := s.registerPending(sess, req.Nonce)
 	if !ok {
 		debugf("connect rate limited (pending) realm=%s session=%s remote=%s", id, sess.id, remote)
+		s.metrics.connectOutcome("rate_limited")
 		writeErr(w, http.StatusServiceUnavailable, errRateLimited, "too many in-flight connect attempts")
 		return
 	}
@@ -294,17 +317,20 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 		debugf("connect notified realm=%s session=%s clientAddresses=%d serverAddresses=%d remote=%s", id, sess.id, len(req.Addresses), len(serverAddrs), remote)
 	} else {
 		debugf("connect rate limited realm=%s session=%s remote=%s", id, sess.id, remote)
+		s.metrics.connectOutcome("rate_limited")
 		writeErr(w, http.StatusServiceUnavailable, errRateLimited, "server event buffer full")
 		return
 	}
 
 	// Now we wait for the fresh addresses to arrive.
+	waitStart := time.Now()
 	timer := time.NewTimer(connectResponseTimeout)
 	defer timer.Stop()
 	select {
 	case payload, ok := <-respCh:
 		if !ok {
 			debugf("connect canceled realm=%s session=%s remote=%s", id, sess.id, remote)
+			s.metrics.connectOutcome("canceled")
 			writeErr(w, http.StatusNotFound, errRealmNotFound, "realm not registered")
 			return
 		}
@@ -312,14 +338,19 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 			serverAddrs = payload.addresses
 			debugf("connect fresh addresses realm=%s session=%s addresses=%d remote=%s", id, sess.id, len(serverAddrs), remote)
 		}
+		s.metrics.observeConnect(time.Since(waitStart))
+		s.metrics.connectOutcome("delivered")
 	case <-timer.C:
 		debugf("connect response timed out realm=%s session=%s remote=%s", id, sess.id, remote)
+		s.metrics.connectOutcome("timeout")
 	case <-sess.done:
 		debugf("connect canceled realm=%s session=%s remote=%s", id, sess.id, remote)
+		s.metrics.connectOutcome("canceled")
 		writeErr(w, http.StatusNotFound, errRealmNotFound, "realm not registered")
 		return
 	case <-r.Context().Done():
 		// Client gave up
+		s.metrics.connectOutcome("client_gave_up")
 		return
 	}
 
@@ -360,9 +391,11 @@ func (s *server) connectResponse(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.deliverPending(sess, nonce, punchResponsePayload{addresses: req.Addresses}) {
 		debugf("connect-response no pending realm=%s session=%s nonce=%s remote=%s", id, sess.id, nonce, remote)
+		s.metrics.connectResponse("no_pending")
 		writeErr(w, http.StatusNotFound, errAttemptNotFound, "no pending attempt for nonce")
 		return
 	}
 	debugf("connect-response delivered realm=%s session=%s addresses=%d remote=%s", id, sess.id, len(req.Addresses), remote)
+	s.metrics.connectResponse("delivered")
 	w.WriteHeader(http.StatusNoContent)
 }
